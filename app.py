@@ -46,7 +46,7 @@ defaults = {
     "locators":      None,
     "java_code":     {},
     "crawl_done":    False,
-    "base_url":      "",        # FIX: store real crawled URL in session
+    "base_url":      "",        # store real crawled URL in session
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -56,7 +56,6 @@ for k, v in defaults.items():
 # HELPER: CALL GROQ  (with error handling)
 # ─────────────────────────────────────────────
 def call_groq(api_key, prompt, system_msg="You are a QA expert."):
-    # FIX: wrap in try/except — never let API errors crash the app
     try:
         client = Groq(api_key=api_key)
         resp = client.chat.completions.create(
@@ -96,7 +95,7 @@ def build_locators(tag, elem):
     edata    = elem.get("data-test", "").strip()
     etext    = elem.get_text(strip=True)[:40]
 
-    # CSS
+    # CSS — priority: id > data-test > name > aria-label > placeholder > type > class > value > bare tag
     if eid:
         css = f"#{eid}"
     elif edata:
@@ -107,16 +106,17 @@ def build_locators(tag, elem):
         css = f"[aria-label='{earia}']"
     elif eplace:
         css = f"{tag}[placeholder='{eplace}']"
-    elif etype:
+    elif etype and etype not in ("submit", "button", "text", "password", "email"):
+        # only use type if it's distinctive, not generic
         css = f"{tag}[type='{etype}']"
     elif eclasses:
         css = f"{tag}.{'.'.join(eclasses[:2])}"
     elif evalue and tag == "input":
         css = f"input[value='{evalue}']"
     else:
-        css = tag
+        css = tag  # bare tag — will be filtered out later
 
-    # XPath
+    # XPath — same priority but text() available for buttons/links/labels
     if eid:
         xpath = f"//{tag}[@id='{eid}']"
     elif edata:
@@ -132,14 +132,14 @@ def build_locators(tag, elem):
         xpath = f"//{tag}[normalize-space()='{safe}']"
     elif etitle:
         xpath = f"//{tag}[@title='{etitle}']"
-    elif etype:
+    elif etype and etype not in ("submit", "button", "text", "password", "email"):
         xpath = f"//{tag}[@type='{etype}']"
     elif eclasses:
         xpath = f"//{tag}[contains(@class,'{eclasses[0]}')]"
     elif evalue and tag == "input":
         xpath = f"//input[@value='{evalue}']"
     else:
-        xpath = f"//{tag}"
+        xpath = f"//{tag}"  # bare tag — will be filtered out later
 
     return css, xpath
 
@@ -187,6 +187,10 @@ def crawl_website(start_url, max_pages=15):
 # ─────────────────────────────────────────────
 # HELPER: EXTRACT LOCATORS
 # ─────────────────────────────────────────────
+
+# FIX: fields that should never appear as @FindBy elements in page objects
+SKIP_FIELD_NAMES = {"csrfmiddlewaretoken", "csrf_token", "_token", "__RequestVerificationToken"}
+
 def extract_locators(pages_dict):
     locators = []
     tags     = ["input", "button", "a", "select", "textarea", "label"]
@@ -198,6 +202,14 @@ def extract_locators(pages_dict):
 
         for tag in tags:
             for elem in soup.find_all(tag)[:20]:
+                # FIX: skip hidden server-side fields — they must never become @FindBy
+                field_name = elem.get("name", "")
+                if field_name in SKIP_FIELD_NAMES:
+                    continue
+                field_type = elem.get("type", "")
+                if field_type == "hidden":
+                    continue
+
                 etext  = elem.get_text(strip=True)[:50]
                 etype  = elem.get("type", tag)
                 eplace = elem.get("placeholder", "")
@@ -214,10 +226,12 @@ def extract_locators(pages_dict):
 
                 css, xpath = build_locators(tag, elem)
 
+                # FIX: skip bare/unidentifiable locators — they cause duplicate @FindBy
                 if css == tag and xpath == f"//{tag}":
                     continue
 
-                key = f"{page_name}|{tag}|{css}|{xpath}"  # FIX: include tag in key
+                # FIX: include tag in dedup key so button and label with same CSS are not merged
+                key = f"{page_name}|{tag}|{css}|{xpath}"
                 if key in seen:
                     continue
                 seen.add(key)
@@ -229,16 +243,54 @@ def extract_locators(pages_dict):
                     "Text / Label": label[:40],
                     "CSS Selector": css,
                     "XPath":        xpath,
-                    "_url":         url,
+                    "_url":         url,   # FIX: store original URL for accurate page URL reconstruction
                 })
 
     return locators
 
 # ─────────────────────────────────────────────
+# FIX: filter ambiguous locators before sending to Groq
+# Removes bare/duplicate CSS selectors that cause duplicate @FindBy annotations
+# ─────────────────────────────────────────────
+BARE_TAGS = {"a", "button", "input", "select", "textarea", "label"}
+
+def filter_unique_locators(page_locs):
+    """
+    Pre-filter locators before sending to Groq for Java code generation.
+    Removes:
+      - Bare tag-only CSS selectors (e.g. "a", "button") — cause duplicate @FindBy
+      - Duplicate CSS selectors on the same page — only first occurrence kept
+      - XPath-only locators where CSS is a bare tag — XPath text() used instead
+    """
+    seen_css   = set()
+    filtered   = []
+
+    for loc in page_locs:
+        css   = loc["CSS Selector"]
+        xpath = loc["XPath"]
+
+        # Skip bare tag-only CSS — too ambiguous, matches many elements
+        if css in BARE_TAGS:
+            continue
+
+        # Skip if this exact CSS already used on this page — duplicate @FindBy
+        if css in seen_css:
+            continue
+
+        # Skip if XPath is also just a bare tag with no discriminator
+        if xpath in {f"//{t}" for t in BARE_TAGS}:
+            continue
+
+        seen_css.add(css)
+        filtered.append(loc)
+
+    return filtered
+
+# ─────────────────────────────────────────────
 # HELPER: PAGE SUMMARY
 # ─────────────────────────────────────────────
 def build_page_summary(pages_dict):
-    # FIX: increased from 8 to 12 pages so AI sees more of the site
+    # increased from 8 to 12 pages so AI sees more of the site
     summary = ""
     for url, html in list(pages_dict.items())[:12]:
         soup    = BeautifulSoup(html, "html.parser")
@@ -260,6 +312,7 @@ def fix_testcase_formatting(raw_text):
     """
     Post-processes AI output to ensure every TC field is on its own line.
     Fixes cases where the LLM merges fields onto one line despite prompt instructions.
+    Streamlit st.markdown() collapses single newlines — double newlines are required.
     """
     fields = [
         "**TC_ID:**", "**Summary:**", "**Page:**",
@@ -440,20 +493,26 @@ must each start on a NEW LINE. Never merge them. Never put two on the same line.
 # HELPER: GENERATE JAVA CODE
 # ─────────────────────────────────────────────
 def generate_java_code(api_key, locators, pages_dict):
-    # FIX: hard stop if no pages — never silently fall back to example.com
+    # Hard stop — never silently fall back to example.com
     if not pages_dict:
         st.error("❌ No crawled pages found. Cannot generate Java code.")
         return {}
 
-    # FIX: real base URL from session (set at crawl time)
+    # Real base URL from session (set at crawl time by the user's input)
     base_url = st.session_state.base_url or list(pages_dict.keys())[0].rstrip("/")
 
     java_files = {}
     pages      = {}
 
+    # FIX: build a lookup from cleaned page_name → real original URL
+    # This fixes the wrong URL path reconstruction bug (e.g. view_cart → view/cart)
+    page_url_lookup = {}
     for loc in locators[:50]:
-        page = loc["Page"].strip("/").replace("/", "_").replace("-", "_") or "home"
-        pages.setdefault(page, []).append(loc)
+        raw_url   = loc.get("_url", base_url)
+        page_key  = loc["Page"].strip("/").replace("/", "_").replace("-", "_") or "home"
+        if page_key not in page_url_lookup:
+            page_url_lookup[page_key] = raw_url
+        pages.setdefault(page_key, []).append(loc)
 
     # ── Page Object classes ──────────────────────────────────────────────────────
     for page_name, page_locs in list(pages.items())[:4]:
@@ -462,21 +521,26 @@ def generate_java_code(api_key, locators, pages_dict):
             + "Page"
         )
 
-        # FIX: build the real full URL for this specific page
-        page_path     = page_name.replace("_", "/")
-        full_page_url = (
-            f"{base_url}/{page_path.strip('/')}"
-            if page_path != "home"
-            else base_url
-        )
+        # FIX: use real stored URL instead of reconstructing from page_name
+        # This prevents view_cart → view/cart → wrong URL bug
+        full_page_url = page_url_lookup.get(page_name, base_url)
+
+        # FIX: filter out ambiguous locators before sending to Groq
+        # This prevents duplicate @FindBy(css = "a") / @FindBy(css = "button") in output
+        clean_locs    = filter_unique_locators(page_locs)[:12]
+
+        if not clean_locs:
+            # All locators were bare tags — skip this page to avoid generating useless class
+            continue
 
         elements_info = "\n".join([
             f'  [{l["Tag"]}] label="{l["Text / Label"]}" '
             f'CSS="{l["CSS Selector"]}" XPath="{l["XPath"]}"'
-            for l in page_locs[:12]
+            for l in clean_locs
         ])
 
-        # FIX: URL injected twice in prompt to suppress hallucination
+        # URL injected twice in prompt — at top (IMPORTANT) and in requirements
+        # Double injection significantly reduces Groq hallucinating placeholder URLs
         prompt = f"""
 Generate a complete Selenium Java Page Object Model class named {class_name}.
 
@@ -490,12 +554,24 @@ Requirements:
 - Package: pages
 - Import: config.BaseConfig
 - Add: public static final String PAGE_URL = "{full_page_url}";
-- Use @FindBy with CSS selector (XPath as fallback)
+- Use @FindBy annotations only — DO NOT use By.* inside page object methods
+- Prefer CSS selector for @FindBy; use XPath only when CSS is unavailable
 - Constructor: takes WebDriver, calls PageFactory.initElements(driver, this)
 - Add a navigateTo(WebDriver driver) method: driver.get(PAGE_URL)
-- One action method per element (click, sendKeys, getText)
-- Include ALL imports
+- One action method per element: clickX(), enterX(String text), getXText()
+- Include ALL imports (WebDriver, WebElement, FindBy, PageFactory)
 - driver.get() must always use "{full_page_url}" — never example.com or any placeholder
+
+STRICT LOCATOR RULES — follow exactly, no exceptions:
+1. NEVER use a bare tag as @FindBy value — css = "a", css = "button", css = "input" are FORBIDDEN
+2. If the CSS selector provided is just a tag name, use the XPath value instead
+3. NEVER create two @FindBy fields with the same CSS or XPath value
+4. If two elements share the same locator, keep only the FIRST and skip the rest
+5. For <a> navigation links, ALWAYS use XPath: //a[normalize-space()='Link Text']
+6. For <button> without an id, ALWAYS use XPath: //button[normalize-space()='Button Text']
+7. NEVER add csrfmiddlewaretoken or any hidden input as a @FindBy field
+8. Every @FindBy must uniquely identify exactly ONE element on the page
+
 - Return ONLY valid Java code. No explanation. No markdown fences.
 """
         code = call_groq(
@@ -512,12 +588,15 @@ Requirements:
         "".join(w.capitalize() for w in re.split(r"[_\-\s]+", p) if w) + "Page"
         for p in list(pages.keys())[:4]
     ]
+
+    # FIX: filter sample locators sent to test prompt — no bare tags in test code either
+    clean_sample_locs = filter_unique_locators(locators[:30])
     sample = "\n".join([
-        f'  [{l["Tag"]}] "{l["Text / Label"]}" CSS: {l["CSS Selector"]}'
-        for l in locators[:20]
+        f'  [{l["Tag"]}] "{l["Text / Label"]}" CSS: {l["CSS Selector"]} | XPath: {l["XPath"]}'
+        for l in clean_sample_locs[:20]
     ])
 
-    # FIX: URL injected into test prompt, BASE_URL constant enforced
+    # URL injected into test prompt twice + explicit import rule + instantiation rule
     test_prompt = f"""
 Generate a complete Selenium Java TestNG test class named WebAppTest.
 
@@ -527,37 +606,72 @@ Never use placeholder URLs like example.com, your-website.com, or any invented U
 
 Page Object classes available: {", ".join(page_classes)}
 
-Key elements found on the site:
+Key elements found on the site (use these real locators):
 {sample}
 
 Requirements:
 - Package: tests
 - Import: config.BaseConfig
+- Import Assert as: import org.testng.Assert
+  (NEVER import org.testng.asserts.Assert — that is the wrong class)
+- Import: import java.time.Duration
 - Declare at top: public static final String BASE_URL = "{base_url}";
-- @BeforeClass: setup ChromeDriver via WebDriverManager, then driver.get(BASE_URL)
-- @AfterClass: quit driver
+- Declare WebDriver driver as instance variable
+- Declare and instantiate all page objects as instance variables in @BeforeClass
+- @BeforeClass setup steps IN THIS ORDER:
+    1. WebDriverManager.chromedriver().setup();
+    2. driver = new ChromeDriver();
+    3. driver.manage().window().maximize();
+    4. driver.manage().timeouts().implicitlyWait(Duration.ofSeconds(10));
+    5. driver.get(BASE_URL);
+    6. Instantiate all page object classes: homePage = new HomePage(driver); etc.
+- @AfterClass: driver.quit()
 - Exactly 6 @Test methods:
-  1. testPageTitle()       — driver.get(BASE_URL), verify title is not empty
-  2. testNavigationLinks() — click nav links using real locators, verify page loads
-  3. testFormInputs()      — fill and submit a form using real locators
-  4. testButtonClicks()    — click buttons using real locators, verify no crash
-  5. testDataDriven()      — @DataProvider with 2 realistic data sets for this site
-  6. testElementsVisible() — assert key elements from above are displayed
-- Use Assert for all checks
+  1. testPageTitle()
+     - driver.get(BASE_URL)
+     - Assert.assertFalse(driver.getTitle().isEmpty(), "Title should not be empty")
+     - Assert.assertNotNull(driver.getTitle())
+
+  2. testNavigationLinks()
+     - Use ONLY XPath text locators: By.xpath("//a[normalize-space()='Link Text']")
+     - NEVER use By.cssSelector("a") or any bare tag selector
+     - Click each nav link, assert title is not empty, navigate back
+
+  3. testFormInputs()
+     - Use specific CSS/XPath from the elements list above
+     - Fill form fields with realistic test data for this site
+     - Submit and assert title not empty
+
+  4. testButtonClicks()
+     - Use XPath text locators for buttons: By.xpath("//button[normalize-space()='Text']")
+     - NEVER use By.cssSelector("button") — too ambiguous
+     - Assert after each click that driver title or current URL is not null
+
+  5. testDataDriven() with @DataProvider(name = "loginData")
+     - @DataProvider returns Object[][] with 2 rows of realistic email/password pairs
+     - Use specific input locators from the elements list above
+     - Assert title not empty after each submission
+
+  6. testElementsVisible()
+     - Assert each key element isDisplayed() using specific locators from the list above
+     - NEVER use By.cssSelector("a") or bare tag selectors here
+
+- Use Assert.assertTrue / Assert.assertFalse / Assert.assertNotNull for all checks
 - Every driver.get() must use BASE_URL or BASE_URL + "/path" — NEVER a fake URL
 - Include ALL imports
 - Return ONLY valid Java code. No explanation. No markdown fences.
 """
     test_code = call_groq(
         api_key, test_prompt,
-        "You are a Selenium Java TestNG expert. Return only clean Java code, no markdown.",
+        "You are a Selenium Java TestNG expert. Return only clean Java code, no markdown. "
+        "Use org.testng.Assert (not org.testng.asserts.Assert). "
+        "Never use bare CSS selectors like By.cssSelector('a') or By.cssSelector('button').",
     )
     if test_code:
         test_code = re.sub(r"```(?:java)?|```", "", test_code).strip()
         java_files["src/test/java/tests/WebAppTest.java"] = test_code
 
     # ── BaseConfig.java — centralised URL + settings ─────────────────────────────
-    # FIX: generated config class so URL lives in one place across all files
     java_files["src/main/java/config/BaseConfig.java"] = f"""\
 package config;
 
@@ -573,8 +687,7 @@ public class BaseConfig {{
 }}
 """
 
-    # ── pom.xml — fixed dependency versions ─────────────────────────────────────
-    # FIX: 4.18.1 → 4.21.0, 5.7.0 → 5.8.0 (real published versions)
+    # ── pom.xml — real published dependency versions ─────────────────────────────
     java_files["pom.xml"] = f"""\
 <?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0"
@@ -623,8 +736,7 @@ public class BaseConfig {{
   </build>
 </project>"""
 
-    # ── testng.xml — so mvn test works out of the box ───────────────────────────
-    # FIX: was missing entirely in original code
+    # ── testng.xml ───────────────────────────────────────────────────────────────
     java_files["testng.xml"] = f"""\
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE suite SYSTEM "https://testng.org/testng-1.0.dtd">
@@ -678,7 +790,7 @@ if start_btn:
         pages = crawl_website(url_input, max_pages=max_pages_input)
         st.session_state.crawled_pages = pages
         st.session_state.crawl_done    = True
-        # FIX: store the real base URL in session state at crawl time
+        # Store the exact URL the user typed — used in all generated files
         st.session_state.base_url      = url_input.rstrip("/")
 
     st.success(f"✅ Crawl complete! Found **{len(pages)} pages**. Continue in the tabs below.")
@@ -688,7 +800,6 @@ if start_btn:
 # ─────────────────────────────────────────────
 if st.session_state.crawl_done:
 
-    # FIX: show the crawled URL at the top so user knows it's captured
     st.info(f"🌐 Target URL: **{st.session_state.base_url}** — this URL will appear in all generated files.")
 
     tab1, tab2, tab3, tab4, tab5 = st.tabs([
@@ -732,7 +843,7 @@ if st.session_state.crawl_done:
         st.caption("Individual test cases: Summary → Page → Prerequisites → Steps → Expected Result → Priority → Type.")
 
         if st.session_state.test_cases:
-            # FIX: apply post-processor to fix any inline fields before rendering
+            # Apply post-processor to fix any inline fields before rendering
             clean_output = fix_testcase_formatting(st.session_state.test_cases)
             st.markdown(clean_output)
             if st.button("🔄 Regenerate Test Cases"):
@@ -758,8 +869,8 @@ if st.session_state.crawl_done:
 
         if st.button("🔍 Extract Locators", type="primary"):
             with st.spinner("Scanning all pages for interactive elements..."):
-                st.session_state.locators = extract_locators(st.session_state.crawled_pages)
-                # FIX: reset downstream state when locators change
+                st.session_state.locators  = extract_locators(st.session_state.crawled_pages)
+                # Reset downstream state when locators change
                 st.session_state.java_code = {}
 
         if st.session_state.locators is not None:
@@ -770,15 +881,24 @@ if st.session_state.crawl_done:
                     "Try **https://the-internet.herokuapp.com** or **https://automationbookstore.dev**."
                 )
             else:
+                # FIX: show both raw count and filtered count so user knows what Java code will use
+                clean_count = len(filter_unique_locators(locs))
                 st.success(f"✅ Found **{len(locs)} elements** across all pages.")
-                df       = pd.DataFrame(locs)
+                if clean_count < len(locs):
+                    st.info(
+                        f"ℹ️ **{clean_count} unique identifiable elements** will be used for Java code. "
+                        f"{len(locs) - clean_count} elements with bare/ambiguous selectors are excluded "
+                        "to prevent duplicate @FindBy annotations."
+                    )
+
+                df        = pd.DataFrame(locs)
                 pages_opt = ["All Pages"] + sorted(df["Page"].unique().tolist())
-                sel      = st.selectbox("Filter by Page", pages_opt)
-                filtered = df if sel == "All Pages" else df[df["Page"] == sel]
-                cols     = ["Page", "Tag", "Type", "Text / Label", "CSS Selector", "XPath"]
+                sel       = st.selectbox("Filter by Page", pages_opt)
+                filtered  = df if sel == "All Pages" else df[df["Page"] == sel]
+                cols      = ["Page", "Tag", "Type", "Text / Label", "CSS Selector", "XPath"]
                 st.dataframe(filtered[cols], use_container_width=True, height=400)
                 st.caption(f"Showing {len(filtered)} of {len(locs)} elements")
-                # FIX: show truncation warning if locators exceed the Java code limit
+
                 if len(locs) > 50:
                     st.warning(
                         f"⚠️ {len(locs)} elements found but Java code will use the first 50. "
@@ -795,7 +915,7 @@ if st.session_state.crawl_done:
         elif len(st.session_state.locators) == 0:
             st.warning("⚠️ No locators found. Cannot generate code.")
         elif st.session_state.java_code:
-            # FIX: show which URL is used — visible confirmation for user
+            # Show URL confirmation — user can see their URL is in the code
             st.success(f"✅ Generated for: **{st.session_state.base_url}**")
             for fname, code in st.session_state.java_code.items():
                 lang = "java" if fname.endswith(".java") else "xml"
@@ -805,8 +925,9 @@ if st.session_state.crawl_done:
                 st.session_state.java_code = {}
                 st.rerun()
         else:
+            clean_count = len(filter_unique_locators(st.session_state.locators))
             st.info(
-                f"Ready to generate from **{len(st.session_state.locators)} elements** "
+                f"Ready to generate from **{clean_count} unique elements** "
                 f"for **{st.session_state.base_url}**"
             )
             if st.button("⚙️ Generate Java Code", type="primary"):
